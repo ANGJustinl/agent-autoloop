@@ -222,7 +222,7 @@ GET /v1/cards/next?wait=50    Authorization: Bearer <通道的密钥>
 
 ```
 GET  /v1/state              Authorization: Bearer <本人的密钥>
-→ 200 { "totals", "cards", "recentCards", "agents", "channels", "sources", "lines", "elsewhere", "runs", "nextBefore", "unrouted" }
+→ 200 { "cursor", "totals", "cards", "recentCards", "agents", "channels", "sources", "lines", "elsewhere", "runs", "nextBefore", "unrouted" }
 
 POST /v1/cards/56/answer    { "choice": 1 } 或 { "text": "别的想法" }
 POST /v1/cards/56/resolve   { "reason": "不用决定了，因为……" }
@@ -230,6 +230,8 @@ POST /v1/runs/12/cancel     {}
 ```
 
 `agent-autoloop status`、`answer`、`resolve`、`stop` 就是这几个请求。`/v1/state` 一次给最近 60 轮，`?before=<nextBefore>` 翻更早的。
+
+`cursor` 是这份快照对应的日志序号，与所有返回行在同一个读取事务中取得。客户端可先读快照，再从 `/v1/stream?after=<cursor>` 续接；从旧位置重建关系时，可用它判断是否已经读到快照的位置。分页仍各自返回当次快照的游标，不表示所有历史页来自同一时刻。它不授予任何权限，旧客户端可以忽略这个新增字段。
 
 `/v1/state` 的 `spending.today`、`spending.week` 独立于分页，按规则时区的今天和过去 7 × 24 小时的完成时间汇总。每项含 `rounds`、`tokens`、`cost`、`missingTokens`、`missingCost`，后两项是没报对应用量的轮数；从未开始就取消的轮次不计入。旧请求和响应字段保持不变，旧客户端可以忽略新增字段；新版 `status` 需要中台一起更新，不再逐页读取历史来算费用。
 

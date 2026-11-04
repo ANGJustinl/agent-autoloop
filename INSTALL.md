@@ -32,6 +32,8 @@ AGENT_AUTOLOOP_REPO=/path/to/agent-autoloop sh /path/to/agent-autoloop/install.s
 
 升级时若投影格式有变化，会自动从旧日志逐条重建，历史多时首次启动需要等待；之后正常启动直接复用投影。原日志和已有卡片链接保留，不需要手动迁移。
 
+状态接口新增 `cursor`，表示同一读取事务里的快照日志位置。旧客户端仍可使用；需要用快照接事件流的客户端，应核对中台已经提供这个字段。
+
 ## 临时 HOME、CI 或没有服务管理器
 
 使用临时 HOME 时不要装系统服务，不改真实用户的 shell 配置和 Agent 配置。保留调用者给定的 `AGENT_AUTOLOOP_HOME`；用真实 `CODEX_HOME` 只为了沿用已经完成的 Codex 登录。

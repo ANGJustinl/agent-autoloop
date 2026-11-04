@@ -15,6 +15,8 @@ description: 配置 Agent 自动化中台：加规则、接新的事件插件、
 
 这里没有网页。用户想要一个页面看全局，就替他写一个：读 `GET /v1/state`，密钥是 `config.json` 的 `owner`，请求见 `docs/protocol.md` 的「本人」一节。
 
+状态响应的 `cursor` 和返回内容来自同一个读取事务。客户端可据此从 `/v1/stream?after=<cursor>` 续读；自己重建历史关系时，读到这个序号才算追上这次快照。
+
 ## 改规则
 
 改 `rules.json`，运行 `agent-autoloop check`。几秒内生效；写错了旧规则继续跑，并推一张卡片说错在哪。尚未领取的任务在领活时一起更新 Agent、目录和权限；已领取任务的 Job 配置与接单程序保留到这次执行结束。

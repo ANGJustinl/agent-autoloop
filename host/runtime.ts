@@ -223,8 +223,23 @@ export function answerByLink(token: string, given: Answer, now = Date.now()) {
 export const view = (card: Row, ref: string | null = null, links = false) =>
   query.cardView(card, environment, ref, links);
 export const unrouted = (limit = 20) => query.unrouted(getView(), limit);
-export const stateOf = (now = Date.now(), before?: number) =>
-  state(now, before, query.configuration(getView()), { all, view, unrouted });
+export function stateOf(now = Date.now(), before?: number) {
+  // A CLI may commit between these queries. The cursor and every returned row must share the same WAL snapshot.
+  const ownsTransaction = !db.isTransaction;
+  if (ownsTransaction) db.exec("BEGIN");
+  try {
+    const snapshot = getView();
+    const result = {
+      ...state(now, before, query.configuration(snapshot), { all, view, unrouted }),
+      cursor: snapshot.seq,
+    };
+    if (ownsTransaction) db.exec("COMMIT");
+    return result;
+  } catch (error) {
+    if (ownsTransaction && db.isTransaction) db.exec("ROLLBACK");
+    throw error;
+  }
+}
 
 export type KeyKind = "source" | "worker" | "channel" | "owner";
 export const keepKeyHash = (kind: KeyKind, name: string, hash: string, now = Date.now()) =>

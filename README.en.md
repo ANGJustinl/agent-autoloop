@@ -1,5 +1,7 @@
 # Agent Autoloop
 
+Independent clients can read `/v1/state` and resume `/v1/stream` from its transaction-consistent `cursor`. Existing clients may ignore this additive field; see the protocol.
+
 **Let your command-line agents pick up work and follow it through in the background — staying quiet when they can handle it, and sending you a card only when a decision is yours to make.**
 
 [中文](README.md) | **English**

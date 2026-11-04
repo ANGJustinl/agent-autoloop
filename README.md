@@ -214,6 +214,8 @@ Apple M5 Pro、24 GB、Node 24.21.0。写入逐条提交，事务落盘后才应
 
 ## 更多文档
 
+独立客户端可读取 `/v1/state`，用同一事务内的快照 `cursor` 接续 `/v1/stream`；旧客户端可忽略这个新增字段，见协议。
+
 - [安装说明](INSTALL.md)
 - [规则与交付流水线配置手册](skills/agent-autoloop/SKILL.md)
 - [如何编写插件](docs/plugins.md)
