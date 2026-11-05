@@ -33,13 +33,13 @@ node --disable-warning=ExperimentalWarning --test --test-name-pattern='agent-aut
 | `link(session)` | 可选，会话链接；支持会话的插件可只重写错误回执 |
 | `check()` | 可选，能用返回 `null`，否则返回下一步怎么做 |
 
-`turn` 包含 `prompt`、`session`、`resume`、`cwd`、`access`、`model`、`effort`、`command`、`contextFile`、`folder`。`contextFile` 是资料文件，受限 CLI 需要允许读取 `folder`。`read` 要能处理未写完的输出；CLI 真正完成后才返回 `text`。
+`turn` 包含 `prompt`、`session`、`resume`、`cwd`、`access`、`model`、`effort`、`command`、`contextFile`、`folder`。`contextFile` 是资料文件，受限 CLI 需要允许读取 `folder`。`read` 要能处理未写完的输出；CLI 真正完成后才返回 `text`。`read` 抛错或什么也不返回时，还在跑的接着跑，结束后这一轮算没跑成，留在原会话重派。
 
 支持 `resume` 的插件，从 Agent 收下提示词起都要返回 `started: true`，包括运行中和出错之后。否则干到一半断了，也会被当成会话接不上，开新会话把业务重做一遍。
 
 `usage` 是这次启动用掉的量。有的 CLI 只给整个会话累计到现在的数（Codex 的 Token、Claude Code 的费用），这几项放进 `sessionUsage`，同时要返回 `session`。接单程序启动前记下这个会话上次的累计值，结束后相减，和 `usage` 合起来上报；这些记录放在 `worker/usage/`，接单程序中途重启也不会多算。
 
-没有记录的续接（换了电脑、升级前就有的会话）或累计值变小时，这几项这次不报，不猜；下一次续接恢复正常。其他程序在同一个会话里用掉的量分不出来，比如本人打开链接接着聊，会算进下一次续接。CLI 改成只报单次时，插件要把这几项改回 `usage`，不要靠数字大小去猜。
+没有记录的续接（换了电脑、升级前就有的会话、超过 90 天没用的会话）或累计值变小时，这几项这次不报，不猜；下一次续接恢复正常。其他程序在同一个会话里用掉的量分不出来，比如本人打开链接接着聊，会算进下一次续接。CLI 改成只报单次时，插件要把这几项改回 `usage`，不要靠数字大小去猜。
 
 在规则里选择这个插件：
 
@@ -72,7 +72,7 @@ Claude 委托 Codex 的完整规则、Skill 和参数调用脚本见[浏览器�
 | `hub.failed(id, version, error)` | 报告发送失败 |
 | `hub.answer(id, { choice, by, ref })` | 转交回答；核对回答人和原消息 |
 
-`ref` 为空就发新消息，有值就更新原消息；不能更新时只报告。没报告的卡片一分钟后重派。`signal` 中止时退出，函数异常退出后由外壳重启。
+`ref` 为空就发新消息，有值就更新原消息；不能更新时只报告。没报告的卡片一分钟后重派。`signal` 中止时退出；函数在此之前返回或抛错，都记日志并在 30 秒后重启，所以它要一直运行。插件和中台在同一个进程里：没接住的错误只记日志，不让中台退出。
 
 在 `rules.json` 登记通道、用 `agent-autoloop key new channel cards` 取密钥，再把下面这项放进 `config.json` 的 `channels`，重启中台：
 
@@ -80,7 +80,7 @@ Claude 委托 Codex 的完整规则、Skill 和参数调用脚本见[浏览器�
 { "cards": { "use": "hello-channel", "key": "通道密钥", "file": "/tmp/cards.txt" } }
 ```
 
-能收回调的通道要在规则里设置 `answerers`；只能发文字的通道设置 `links: true`，发送 `card.link`。拿到链接的人能回答这张卡片。
+能收回调的通道要在规则里设置 `answerers`，没设时通道里谁都能回答，`doctor` 会提醒；只能发文字的通道设置 `links: true`，发送 `card.link`。拿到链接的人能回答这张卡片。
 
 通道和中台共用一个 Node 进程，外部调用应异步等待。内置飞书通道的用户查询、发送和更新均异步调用 CLI，发送期间中台仍能接收事件和心跳。
 

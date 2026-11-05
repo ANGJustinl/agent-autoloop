@@ -8,12 +8,17 @@ import { findProgram, tail, type Adapter } from "../../worker/agents.ts";
 const PERMISSIONS = { read: "plan", edit: "acceptEdits", full: "bypassPermissions" };
 
 /** The newest Claude Code the desktop app ships, for those without a separate install. */
-function inTheApp() {
+export function inTheApp() {
   const root = path.join(homedir(), "Library/Application Support/Claude/claude-code");
   if (!existsSync(root)) return [];
-  const oldestFirst = readdirSync(root).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  // The app keeps its own files, such as auto-update-state.json, beside the version folders.
+  const folders = (at: string) =>
+    readdirSync(at, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name);
+  const oldestFirst = folders(root).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
   return oldestFirst.reverse().flatMap((version) => {
-    const builds = readdirSync(path.join(root, version));
+    const builds = folders(path.join(root, version));
     return builds.map((build) => path.join(root, version, build, "claude.app/Contents/MacOS/claude"));
   });
 }

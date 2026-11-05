@@ -11,6 +11,9 @@ export const credential = (env: Environment, purpose: string, ...parts: unknown[
     .update(JSON.stringify([purpose, ...parts]))
     .digest("base64url");
 
+/** What a card is found by from its link, which isn't stored. */
+export const cardHash = (env: Environment, id: unknown, at: unknown) => digest(credential(env, "card", id, at));
+
 export function whose(view: View, kind: string, key: string): string | null {
   if (!key) return null;
   const given = Buffer.from(digest(key), "hex");

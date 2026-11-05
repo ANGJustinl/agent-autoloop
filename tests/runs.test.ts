@@ -12,6 +12,8 @@
 // gone with work in hand frees its group while the work may still be going; cancelling frees the thread before the worker
 // has stopped; a retry doesn't get its own session back; retries overwrite usage or replayed results count it twice; a run
 // that keeps failing goes on spending for good, stops without telling the owner, or takes newer events down with it.
+// A report of starting is taken whatever it holds, however long; stopping a run that isn't there or has ended crashes,
+// or marks it as stopping.
 // Reloading rules must not combine an old agent with a new folder, or change an already claimed job and its worker.
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -20,7 +22,7 @@ import { at, setup } from "./helpers.ts";
 setup("runs");
 const { ingest } = await import("../host/runtime.ts");
 const { claimNext, heartbeat, finish, started, sweep, cancel, cancels } = await import("../host/runtime.ts");
-const { AuthError, Conflict, InputError } = await import("../kernel/errors.ts");
+const { AuthError, Conflict, InputError, NotFound } = await import("../kernel/errors.ts");
 const { all, one, run } = await import("./storage.ts");
 
 const note = (n: number, step = "new") => ({
@@ -527,6 +529,37 @@ test("cancelling a waiting run ends it; cancelling a running one holds its threa
   assert.equal(state(going.run), "cancelled");
   assert.deepEqual(cancels("w2"), []);
   assert.ok(claim("w2", at(5)));
+});
+
+test("stopping a run that isn't there, or has already ended, is refused and changes nothing", () => {
+  clean();
+  assert.throws(() => cancel(9999, at(0)), NotFound);
+  ingest("ops", alert("x"), at(0));
+  const job = claim("w2", at(0))!;
+  finish(job.run, job.token, { outcome: "done", summary: "好了" }, at(1));
+  assert.throws(() => cancel(job.run, at(2)), InputError);
+  const row = one<{ state: string; cancel_at: string | null }>("SELECT state, cancel_at FROM runs WHERE id = ?", [
+    job.run,
+  ])!;
+  assert.deepEqual([row.state, row.cancel_at], ["done", null]);
+});
+
+test("a report of starting is bounded, and a refused one changes nothing", () => {
+  clean();
+  ingest("ops", alert("x"), at(0));
+  const job = claim("w2", at(0))!;
+  const reported = () => {
+    const row = one<{ session: string | null; link: string | null }>("SELECT session, link FROM runs WHERE id = ?", [
+      job.run,
+    ])!;
+    return [row.session, row.link];
+  };
+  for (const bad of [{ session: 42 }, { link: {} }, { session: "s".repeat(501) }, { link: "l".repeat(501) }])
+    assert.throws(() => started(job.run, job.token, bad, at(1)), InputError, JSON.stringify(bad));
+  assert.deepEqual(reported(), [null, null]);
+  // The limit itself is allowed.
+  started(job.run, job.token, { session: "s".repeat(500), link: "l".repeat(500) }, at(1));
+  assert.deepEqual(reported(), ["s".repeat(500), "l".repeat(500)]);
 });
 
 test("a run's usage and session are kept", () => {

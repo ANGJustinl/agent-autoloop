@@ -2,17 +2,25 @@
 // replay loses rules, keys or receipts; plaintext capabilities enter the log; projection writes bypass evolve;
 // a crash commits half a receipt; stream loses its cursor; why cannot identify the rule used for a run.
 // Normalizing receipt events must not mutate the request; reconnecting workers must close offline cards without a tick.
+// Closing that card must not bring it straight back, or hide work that comes later for as long as the worker stays away.
 // Rebuilding a projection must hold the same transaction as its log snapshot, or it can overwrite a concurrent receipt.
 // Source event IDs must not collide with internally generated answer or timer IDs.
 // Quiet notices must not escape through a channel; a stale writer must receive Conflict rather than a database failure.
 // A queued run whose rule was removed or renamed waits for good, unnoticed, because nothing can claim it.
+// A run stopped by its failed receipt puts that receipt's usage, session and dedupe mark back to what they were before it.
 // Existing logs can contain a queued run with an old agent after a rules change; replay must retain claimed configurations.
+// An input the kernel doesn't have must be refused, even one named like something every object inherits.
+// A deadline nothing will move on again has the shell's one timer firing at once for good: a schedule whose rule is gone or
+// no longer scheduled, a resend whose time has passed with the channel gone. A resend must also come due at its time, or
+// a channel waiting for the next card isn't woken for it.
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { empty, evolve, rows, snapshot, type Fact } from "../kernel/evolve.ts";
 import { decide } from "../kernel/decide.ts";
+import { InputError } from "../kernel/errors.ts";
 import { parseRules } from "../protocol/rules.ts";
+import { at } from "./helpers.ts";
 
 const environment = { secret: "simulation-secret", publicUrl: "https://hub.test" };
 const rules = parseRules(readFileSync(new URL("./rules.fixture.json", import.meta.url), "utf8"), 0, "UTC");
@@ -146,6 +154,30 @@ test("a run already going when its rule goes finishes normally, and if it fails 
     view.close();
   }
 });
+test("a run stopped by its failed receipt keeps that receipt's usage, session and dedupe mark", () => {
+  let view = seeded();
+  const act = (type: string, ...args: unknown[]) => {
+    const decided = decide(view, { type, args }, 1000, environment);
+    view = evolve(view, decided.facts);
+    return decided.value;
+  };
+  try {
+    act("ingest", "app", { id: "held", type: "feedback.new" });
+    const job = act("claimNext", "w1", "claim");
+    const renamed = structuredClone(rules);
+    renamed.rules.find((rule: { name: string }) => rule.name === "意见")!.name = "新名字";
+    act("rules", renamed);
+    const receipt = { outcome: "failed", error: "没跑成", session: "s1", usage: { input: 5 } };
+    act("finish", job.run, job.token, receipt);
+    const stopped = view.get("runs", job.run)!;
+    assert.equal(stopped.state, "cancelled");
+    assert.equal(stopped.session, "s1");
+    assert.deepEqual(JSON.parse(stopped.usage).input, 5);
+    assert.equal(act("finish", job.run, job.token, receipt).duplicate, true);
+  } finally {
+    view.close();
+  }
+});
 test("facts replay the whole receipt with no capability plaintext", () => {
   let view = empty();
   const log: Fact[] = [];
@@ -184,6 +216,65 @@ test("one due table retains cron, retry, timer and offline deadlines without per
   assert.deepEqual(decide(v, { type: "tick", args: [] }, 2000, environment).facts, []);
 });
 
+test("a schedule whose rule is gone or no longer scheduled stops coming due", () => {
+  let v = seeded();
+  const act = (type: string, args: unknown[], now: number) => {
+    v = evolve(v, decide(v, { type, args }, now, environment).facts);
+  };
+  act("tick", [], 1000);
+  const schedules = () =>
+    rows(v, "due")
+      .filter((due) => due.kind === "cron")
+      .map((due) => due.key)
+      .sort();
+  assert.deepEqual(schedules(), ["巡检", "早报"].sort());
+  const withoutMorning = rules.rules.filter((rule) => rule.name !== "早报");
+  act("rules", [{ ...rules, rules: withoutMorning }], 2000);
+  assert.deepEqual(schedules(), ["巡检"]);
+  const unscheduled = withoutMorning.map((rule) =>
+    rule.name === "巡检" ? { ...rule, when: { source: "app", types: ["poll.done"] } } : rule,
+  );
+  act("rules", [{ ...rules, rules: unscheduled }], 3000);
+  assert.deepEqual(schedules(), []);
+  // Nothing moves their next time on any more, so past it they would be overdue on every tick from then on.
+  act("tick", [], 30 * 24 * 3600_000);
+  assert.deepEqual(schedules(), []);
+});
+
+test("a card's resend comes due at its time, and stops being due once that's passed, it's sent, or it's given up", () => {
+  let v = seeded();
+  const act = (type: string, args: unknown[], now: number) => {
+    const d = decide(v, { type, args }, now, environment);
+    v = evolve(v, d.facts);
+    return d.value;
+  };
+  const { card } = act("tell", ["k", "应用", "周报"], at(0));
+  const resendAt = (id = card) => rows(v, "due").find((due) => due.kind === "delivery" && due.key === `${id}:chat`)?.at;
+  // Taken and not heard of again: a channel waiting for the next card wakes when this one can go again. The channel may be
+  // gone by then, so the deadline can't stay behind.
+  act("nextCard", ["chat"], at(0));
+  assert.equal(resendAt(), at(1));
+  act("tick", [], at(1));
+  assert.equal(resendAt(), undefined);
+  const tries = [1, 3, 7, 15, 25, 35, 45, 55];
+  for (const [n, minute] of tries.entries()) {
+    const { version } = act("nextCard", ["chat"], at(minute));
+    act("failed", ["chat", card, version, "挂了"], at(minute));
+    assert.equal(resendAt(), n + 1 < tries.length ? at(tries[n + 1]) : undefined, `after the try at ${minute}`);
+  }
+  const { card: sent } = act("tell", ["k2", "应用", "月报"], at(60));
+  const { version } = act("nextCard", ["chat"], at(60));
+  assert.equal(resendAt(sent), at(61));
+  act("delivered", ["chat", sent, version, "om_1"], at(60));
+  assert.equal(resendAt(sent), undefined);
+});
+
+test("an input the kernel doesn't have is refused, even one named like something every object has", () => {
+  const view = seeded();
+  for (const type of ["nope", "constructor", "toString"])
+    assert.throws(() => decide(view, { type, args: [] }, 1000, environment), InputError, type);
+});
+
 test("receipt normalization leaves the request unchanged and can be decided twice", () => {
   let v = seeded();
   const act = (type: string, ...args: unknown[]) => {
@@ -202,6 +293,95 @@ test("receipt normalization leaves the request unchanged and can be decided twic
   const b = decide(v, input, 2000, environment);
   assert.deepEqual(input, before);
   assert.deepEqual(a, b);
+});
+
+/** A hub with one worker and one rule, and what its card about that worker not connecting has come to. */
+function workerAway() {
+  const local = { ...rules, rules: rules.rules.filter((r) => "source" in r.when) };
+  let v = evolve(empty(), decide(empty(), { type: "rules", args: [local] }, 0, environment).facts);
+  const act = (type: string, args: unknown[], now: number) => {
+    const d = decide(v, { type, args }, now, environment);
+    v = evolve(v, d.facts);
+    return d.value;
+  };
+  return {
+    act,
+    cards: () => rows(v, "cards").filter((card) => card.key.startsWith("worker:w1:offline:")),
+    // The shell's only timer is what's here, so a card nothing comes due for is a card that never appears.
+    dueBy: (now: number) => rows(v, "due").filter((due) => due.kind === "offline" && due.at <= now),
+    waiting: () => rows(v, "runs", { state: "queued" }),
+  };
+}
+
+test("the card about a worker not connecting, once closed, stays closed until the worker has been back", () => {
+  const { act, cards, dueBy } = workerAway();
+  act("heartbeat", ["w1", []], 0);
+  act("ingest", ["app", { id: "x", type: "feedback.new" }], 0);
+  assert.deepEqual(dueBy(600000), []);
+  assert.equal(dueBy(600001).length, 1);
+  act("tick", [], 600001);
+  assert.equal(cards().length, 1);
+  assert.deepEqual(dueBy(Infinity), [], "told, so nothing is left to come due");
+  act("answer", [cards()[0].id, { by: "本人" }], 600002);
+  assert.deepEqual(dueBy(Infinity), [], "nothing comes due to bring it back");
+  act("tick", [], 700000);
+  assert.equal(cards().length, 1, "told once for this work");
+  act("heartbeat", ["w1", []], 800000);
+  assert.equal(dueBy(800000 + 600000).length, 0);
+  assert.equal(dueBy(800000 + 600001).length, 1, "back and gone again comes due by itself");
+  act("tick", [], 800000 + 600001);
+  assert.equal(cards().length, 2, "a new absence is told");
+  assert.equal(cards().filter((card) => card.state === "open").length, 1);
+});
+
+test("the card about a worker that has never connected, once closed, stays closed too", () => {
+  const { act, cards, dueBy } = workerAway();
+  act("ingest", ["app", { id: "x", type: "feedback.new" }], 0);
+  assert.deepEqual(dueBy(600000), []);
+  assert.equal(dueBy(600001).length, 1);
+  act("tick", [], 600001);
+  assert.equal(cards().length, 1);
+  act("answer", [cards()[0].id, { by: "本人" }], 600002);
+  assert.deepEqual(dueBy(Infinity), []);
+  act("tick", [], 700000);
+  assert.equal(cards().length, 1);
+  assert.equal(cards()[0].state, "closed");
+});
+
+test("work that comes after the card was closed is told, whether or not the worker was ever seen", () => {
+  for (const seen of [true, false]) {
+    const { act, cards, dueBy, waiting } = workerAway();
+    if (seen) act("heartbeat", ["w1", []], 0);
+    act("ingest", ["app", { id: "x", type: "feedback.new" }], 0);
+    act("tick", [], 600001);
+    act("answer", [cards()[0].id, { by: "本人" }], 600002);
+    act("cancel", [waiting()[0].id], 700000);
+    act("tick", [], 700000);
+    assert.equal(cards().length, 1, "nothing is waiting");
+
+    const later = 7 * 24 * 60 * 60_000;
+    act("ingest", ["app", { id: "y", type: "feedback.new" }], later);
+    const whenDue = seen ? later : later + 600001;
+    assert.deepEqual(dueBy(whenDue - 1), []);
+    assert.equal(dueBy(whenDue).length, 1, "it comes due by itself");
+    act("tick", [], whenDue);
+    assert.equal(cards().length, 2);
+    assert.equal(cards()[1].state, "open");
+    assert.match(cards()[1].text, /1 件任务/);
+    assert.deepEqual(dueBy(Infinity), [], "told, so nothing is left to come due");
+  }
+});
+
+test("more for the work the owner already closed the card on isn't news", () => {
+  const { act, cards, dueBy } = workerAway();
+  act("heartbeat", ["w1", []], 0);
+  act("ingest", ["app", { id: "x", type: "feedback.new" }], 0);
+  act("tick", [], 600001);
+  act("answer", [cards()[0].id, { by: "本人" }], 600002);
+  act("ingest", ["app", { id: "y", type: "feedback.new" }], 700000);
+  assert.deepEqual(dueBy(Infinity), []);
+  act("tick", [], 700000);
+  assert.equal(cards().length, 1);
 });
 
 test("a worker heartbeat closes its offline card with no later scheduled work", () => {

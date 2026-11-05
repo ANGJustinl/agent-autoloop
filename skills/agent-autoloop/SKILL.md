@@ -11,7 +11,7 @@ description: 配置 Agent 自动化中台：加规则、接新的事件插件、
 
 `agent-autoloop status` 列出谁在线、等用户什么、在做什么、做过什么，还有按完成时间统计的今天和最近 7 天的轮数、Token 和费用（同一轮重试的已报用量相加，没上报的轮数会写出来）。`agent-autoloop answer <卡片> <序号>` 回答，`agent-autoloop resolve <卡片> <结果>` 结案，`agent-autoloop stop <第几轮>` 停掉一轮，等整个进程组退出才报告已停。
 
-续接会话也只算这次新增的用量。`worker/usage/` 存着相减要用的累计值，没有记录的续接（比如删了这个目录）这次不报 Codex 的 Token 和 Claude Code 的费用，下一次恢复正常。本人打开链接在同一个会话里接着聊用掉的量，会算进下一次续接。旧回执不重算。
+续接会话也只算这次新增的用量。`worker/usage/` 存着相减要用的累计值，没有记录的续接（比如删了这个目录，或这个会话超过 90 天没用）这次不报 Codex 的 Token 和 Claude Code 的费用，下一次恢复正常。本人打开链接在同一个会话里接着聊用掉的量，会算进下一次续接。旧回执不重算。
 
 这里没有网页。用户想要一个页面看全局，就替他写一个：读 `GET /v1/state`，密钥是 `config.json` 的 `owner`，请求见 `docs/protocol.md` 的「本人」一节。
 
@@ -72,7 +72,7 @@ Claude 主任务要委托 Codex 操作网页时，从 `examples/recipes/browser-
 
 ## 接一个通道
 
-配置在两处：`rules.json` 的 `channels` 登记（`answerers` 是谁能回答），`config.json` 的 `channels` 写密钥和选项。`agent-autoloop key new channel <名字>` 拿密钥（先问用户）。改了 `config.json` 要 `agent-autoloop service install` 重启。
+配置在两处：`rules.json` 的 `channels` 登记（`answerers` 是谁能回答，没写时通道里谁都能回答，`doctor` 会提醒），`config.json` 的 `channels` 写密钥和选项。`agent-autoloop key new channel <名字>` 拿密钥（先问用户）。改了 `config.json` 要 `agent-autoloop service install` 重启。
 
 **桌面通知**：新装的中台默认开着（`plugins/desktop/channel.ts`），两处各有一个 `desktop`。卡片第一次发送时，macOS 用 `osascript`、Linux 用 `notify-send` 弹一条通知，标题为“Agent 问你一个问题”，正文是卡片标题和“运行 agent-autoloop status 查看”，不能在通知上回答。没有图形会话时安静跳过，问题仍在；通知命令失败时报告失败，不会让中台退出。接了别的通道可以留着它；不想要就把两处的 `desktop` 都删掉，再重启。以前装的中台不会自动加上它。
 
@@ -152,6 +152,8 @@ MCP 客户端的启动程序填 `node`，参数为本机引擎绝对路径 `bin/
 2. 每台干活的电脑：服务器上 `agent-autoloop key new worker <名字>`，电脑上 `agent-autoloop join https://中台地址 --worker <名字> --key <密钥>`。`rules.json` 的 Agent 写上对应的 `worker`。
 
 电脑不用开放任何端口，它们自己连过去。
+
+服务器上自己写的系统级 systemd unit，名字要和 `agent-autoloop service install` 用的一样（默认 `agent-autoloop`），`doctor` 才认得出。`agent-autoloop update` 不碰它，更新后自己运行 `systemctl restart` 才会用上新版。
 
 ## 日志与恢复
 

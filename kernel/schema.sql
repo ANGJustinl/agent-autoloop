@@ -24,8 +24,6 @@ CREATE TABLE runs (
   attempts INTEGER NOT NULL DEFAULT 0,
   not_before TEXT NOT NULL,
   claim TEXT,
-  token_hash TEXT,
-  last_token_hash TEXT,
   last_result TEXT,
   cancel_at TEXT,
   resume TEXT,

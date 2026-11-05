@@ -35,7 +35,8 @@ test("commands and the hub can write at the same time", async () => {
     } catch (error) {
       failures.push(String(error));
     }
-    await new Promise((resolve) => setImmediate(resolve));
+    // Not flat out: no real hub writes without a break, and on a slow disk that starves a waiting command past its 5 seconds.
+    await new Promise((resolve) => setTimeout(resolve, 5));
   }
   assert.deepEqual(failures, [], "the hub's own writes");
   assert.deepEqual((await commands).filter(Boolean), [], "the commands' writes");

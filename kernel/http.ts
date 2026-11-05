@@ -102,10 +102,10 @@ async function cardAtLink(call: Call, linkToken: string) {
   const card = call.services.card(linkToken);
   const linksInUse = Object.values(rules.channels).some((channel) => channel.links);
   if (!card || !linksInUse) throw new NotFound("没有这张卡片");
-  if (request.method === "GET") return new Response(cardPage(cardView(card, environment)), { headers: PAGE_HEADERS });
   if (call.now - Date.parse(card.created_at) > LINK_LIFETIME) {
-    throw new AuthError(`这个链接过期了。在装它的电脑上运行 agent-autoloop answer ${card.id} 回答`);
+    throw new AuthError("这个链接过期了。在装它的电脑上运行 agent-autoloop status，还没答的卡片都在那里，可以接着回答");
   }
+  if (request.method === "GET") return new Response(cardPage(cardView(card, environment)), { headers: PAGE_HEADERS });
   const form = new URLSearchParams(await readText(request));
   const choice = form.has("choice") && { choice: Number(form.get("choice")) };
   act(call, "answer", card.id, { ...choice, text: form.get("text") ?? undefined, by: "链接" });

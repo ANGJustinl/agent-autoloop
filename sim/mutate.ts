@@ -55,13 +55,21 @@ const edits: [string, string, string, string][] = [
     'run.state === "queued" && notBefore > now',
     'run.state === "queued" && notBefore < now',
   ],
+  ["due-after-change", "decide.ts", 'if (!draft.changes.length && type !== "tick")', 'if (type !== "tick")'],
+  ["due-at-tick", "decide.ts", 'if (!draft.changes.length && type !== "tick")', "if (!draft.changes.length)"],
+  ["offline-hides-new-work", "due.ts", "waiting.every((run) => run.created_at <= card.closed_at)", "true"],
+  ["offline-closed-comes-back", "due.ts", "waiting.every((run) => run.created_at <= card.closed_at)", "false"],
+  ["link-expiry", "http.ts", "call.now - Date.parse(card.created_at) > LINK_LIFETIME", "false"],
+  ["links-in-use", "http.ts", "if (!card || !linksInUse)", "if (!card)"],
   ["projection-drop", "evolve.ts", "if (row === null)", 'if (row === null || table === "cards")'],
   ["log-order", "store.ts", "ORDER BY seq", "ORDER BY seq DESC"],
   ["stale-commit", "store.ts", "if (latest !== view.seq)", "if (false)"],
   ["log-append", "store.ts", "for (const fact of facts) insert.run", "for (const fact of []) insert.run"],
   ["transaction-removed", "store.ts", "return transaction(db, () => {", "return ((work) => work())(() => {"],
 ];
-const tests = ["kernel", "events", "cards", "runs", "schedule", "stream", "purity"].map((n) => `tests/${n}.test.ts`);
+const tests = ["kernel", "events", "cards", "runs", "schedule", "stream", "purity", "queue-costs", "http"].map(
+  (n) => `tests/${n}.test.ts`,
+);
 export function mutate() {
   const root = join(import.meta.dirname, "..");
   const folder = mkdtempSync(join(tmpdir(), "agent-autoloop-mutation-"));
@@ -87,7 +95,8 @@ export function mutate() {
       file,
       change: (text: string) => {
         assert.ok(text.includes(before), name);
-        return text.replace(before, after);
+        // Everywhere: a guard that's written twice, as the store's transaction is, stands if only one is taken away.
+        return text.replaceAll(before, after);
       },
     }));
     const survived: string[] = [];

@@ -8,7 +8,7 @@ import { createInterface } from "node:readline/promises";
 import { hubClient } from "../protocol/client.ts";
 import { CONFIG_FILE, readConfig, writeConfig, type Config } from "../host/config.ts";
 import { HOME, RULES_FILE } from "../host/home.ts";
-import { installService, removeService, serviceRunning } from "../host/service.ts";
+import { installService, removeService, restartService, serviceRunning, systemUnit } from "../host/service.ts";
 import { versionLine } from "../host/version.ts";
 import { spendLine } from "./spend.ts";
 import { attemptsOf, newFailure, waitingRetry } from "./try.ts";
@@ -43,13 +43,24 @@ const HELP = `Agent 自动化中台
   agent-autoloop mcp                      用标准输入输出连接 MCP 客户端
   agent-autoloop join <中台地址> --worker <名字> --key <密钥>
                                     另一台电脑只接活时用
-  agent-autoloop update                  更新到最新版
+  agent-autoloop update                  更新到最新发布的版本
   agent-autoloop uninstall [--yes]       卸载程序并保留数据；--yes 跳过确认
   agent-autoloop --version               版本和当前提交
   agent-autoloop up                      启动（平时由系统服务调用）
   agent-autoloop service install|remove  系统服务
 
 配置和数据在 ${HOME}。规则在 ${RULES_FILE}，改了自动生效。`;
+
+const INIT_USAGE = `用法：agent-autoloop init [--agent claude|codex] [--command '某个命令 {prompt}'] [--port 3350] [--no-service]
+
+  --agent      只接这个 Agent：claude 或 codex。不写就接本机装好的全部
+  --command    改用别的命令行 Agent；{prompt} 会作为一个独立参数传进去
+  --port       中台监听的端口，默认 3350
+  --no-service 先不装系统服务，之后手动运行 agent-autoloop up`;
+
+const TRY_USAGE = `用法：agent-autoloop try
+
+用本机接好的 Agent 跑一遍完整流程：提问，进程退出等你回复，你拍板，它接着干完。`;
 
 type Flags = Record<string, string | true>;
 
@@ -72,6 +83,21 @@ const fail = (words: string): never => {
   console.error(words);
   process.exit(1);
 };
+
+/**
+ * The flags a command does read, or a stop naming the ones it does not. A misspelt --port would otherwise install with
+ * the default in silence, and --help would install at all.
+ */
+function flagsOf(args: string[], allowed: string[], usage: string) {
+  if (args.includes("--help") || args.includes("-h")) {
+    console.log(usage);
+    process.exit(0);
+  }
+  const parsed = flags(args);
+  const unknown = Object.keys(parsed.named).filter((name) => !allowed.includes(name));
+  if (unknown.length) fail(`不认识的参数：${unknown.map((name) => `--${name}`).join("、")}\n\n${usage}`);
+  return parsed;
+}
 
 const client = (key: string, config = readConfig()) => hubClient(config.url, key);
 const ownerClient = (config = readConfig()) =>
@@ -151,7 +177,7 @@ async function agentsToUse(named: Flags, worker: string) {
 }
 
 async function init(args: string[]) {
-  const { named } = flags(args);
+  const { named } = flagsOf(args, ["agent", "command", "port", "no-service"], INIT_USAGE);
   if (existsSync(CONFIG_FILE)) return fail(`已经装过了：${CONFIG_FILE}`);
   mkdirSync(HOME, { recursive: true, mode: 0o700 });
   mkdirSync(path.join(HOME, "try"), { recursive: true });
@@ -374,13 +400,21 @@ async function doctor() {
   if (config.hub) {
     const { parseRules } = await importRules();
     try {
-      parseRules(readFileSync(RULES_FILE, "utf8"));
+      const { channels } = parseRules(readFileSync(RULES_FILE, "utf8"));
       say(true, `规则 ${RULES_FILE}`);
+      for (const [id, channel] of Object.entries(channels)) {
+        // Nobody answers from a desktop notification, and a link goes only to whoever it's sent to.
+        if (id !== "desktop" && !channel.links && !channel.answerers) {
+          console.log(`○ ${channel.name}没写 answerers：这个通道里谁都能回答卡片。`);
+        }
+      }
     } catch (error) {
       say(false, (error as Error).message);
     }
   }
-  say(serviceRunning(), serviceRunning() ? "系统服务在跑" : "系统服务没在跑：agent-autoloop service install");
+  if (serviceRunning()) say(true, "系统服务在跑");
+  else if (systemUnit()) say(true, "系统级服务在跑");
+  else say(false, "系统服务没在跑：agent-autoloop service install");
   try {
     const health = await (await fetch(`${config.url}/healthz`, { signal: AbortSignal.timeout(5000) })).json();
     say(health.ok === true, `中台 ${config.url}（${String(health.commit).slice(0, 12)}）`);
@@ -526,10 +560,12 @@ function addPlugin(args: string[]) {
 }
 
 async function update() {
-  const pulled = spawnSync("git", ["-C", ROOT, "pull", "--ff-only"], { stdio: "inherit" });
-  if (pulled.status !== 0) return fail("更新失败。");
-  if (serviceRunning()) installService();
-  console.log("更新好了。");
+  const { updateCode } = await import("./update.ts");
+  const { changed, to } = updateCode(ROOT);
+  const version = to ? `（${to}）` : "";
+  if (!changed) return console.log(`已经是最新的${version}。`);
+  const told = restartService();
+  console.log(`更新好了${version}。${told ?? ""}`);
 }
 
 async function askAtTerminal(question: string) {
@@ -546,7 +582,10 @@ const commands: Record<string, () => unknown> = {
   init: () => init(args),
   join: () => join(args),
   up: async () => (await import("../host/up.ts")).up(),
-  try: tryIt,
+  try: () => {
+    flagsOf(args, [], TRY_USAGE);
+    return tryIt();
+  },
   status,
   why: () => why(args),
   conformance: () => checkConformance(args),

@@ -26,7 +26,7 @@ import type { Job } from "../protocol/job.ts";
 import { addUsage, type Notice, type Result } from "../protocol/validate.ts";
 import { adapterFor, type Adapter, type Reading, type Turn, type Usage } from "./agents.ts";
 import { promptFor, readMessage, repairPrompt, resultFrom } from "./contract.ts";
-import { loadUsage, saveUsage, usageDelta } from "./usage.ts";
+import { forgetOldUsage, loadUsage, saveUsage, usageDelta } from "./usage.ts";
 
 const RUNS = path.join(HOME, "worker", "runs");
 const NOTHING: Usage = { input: 0, output: 0, cached: 0, cost: 0 };
@@ -37,6 +37,8 @@ const GRACE = 30_000;
 const STOP_GRACE = 10_000;
 const REPAIRS = 2;
 const KEEP_DAYS = 14;
+/** A worker can run for months, so clearing can't wait for it to start again. */
+const TIDY_EVERY = 60 * 60_000;
 const WAIT = 50;
 const PAUSE = 30_000;
 const UNREACHABLE = 10 * 60_000;
@@ -116,13 +118,18 @@ const files = (entry: Entry) => ({
 const quoted = (word: string) => `'${word.replaceAll("'", `'\\''`)}'`;
 const marker = (entry: Entry) => `agent-autoloop-run:${entry.run}:${entry.attempt}:${entry.turn}`;
 
-function alive(entry: Entry) {
+/** Whether the run's process is still going: false when it is gone, null when we could not look. */
+function alive(entry: Entry): boolean | null {
   if (!entry.pid) return false;
   try {
     const command = execFileSync("ps", ["-p", String(entry.pid), "-o", "command="], { encoding: "utf8" });
     return command.includes(marker(entry));
-  } catch {
-    return false;
+  } catch (error) {
+    // A process that is gone makes ps exit with status 1; anything else (EPERM, EACCES, a spawn
+    // failure) means we could not look, which is not the same as it being gone.
+    const status = (error as { status?: number | null }).status;
+    if (status === 1) return false;
+    return null;
   }
 }
 
@@ -132,15 +139,20 @@ function signal(entry: Entry, name: NodeJS.Signals) {
   } catch {}
 }
 
-function groupAlive(entry: Entry) {
+/** Whether anything in the run's group is still going, null when we could not look. */
+function groupAlive(entry: Entry): boolean | null {
   // The wrapper can die before a child; zombies have already stopped and only their parent can reap them.
-  return execFileSync("ps", ["-ax", "-o", "pgid=", "-o", "stat="], { encoding: "utf8" })
-    .trim()
-    .split("\n")
-    .some((line) => {
-      const [group, state] = line.trim().split(/\s+/);
-      return Number(group) === entry.pid && !state.startsWith("Z");
-    });
+  try {
+    return execFileSync("ps", ["-ax", "-o", "pgid=", "-o", "stat="], { encoding: "utf8" })
+      .trim()
+      .split("\n")
+      .some((line) => {
+        const [group, state] = line.trim().split(/\s+/);
+        return Number(group) === entry.pid && !state.startsWith("Z");
+      });
+  } catch {
+    return null;
+  }
 }
 
 function snapshot(file: string) {
@@ -172,6 +184,14 @@ export function createWorker({
   let unreachableSince: number | null = null;
   let told = false;
   let tries = 0;
+  let blind = false;
+  let tidied = -Infinity;
+  const said = new Set<string>();
+  /** Trouble that lasts comes round every second, and once in the log will do. */
+  const sayOnce = (line: string) => {
+    if (!said.has(line)) log(line);
+    said.add(line);
+  };
   mkdirSync(RUNS, { recursive: true, mode: 0o700 });
 
   const entries = () =>
@@ -277,19 +297,28 @@ export function createWorker({
 
   function read(entry: Entry, adapter: Adapter, code: number | null): Reading {
     const { out, err } = files(entry);
-    return adapter.read(snapshot(out), code, code === null ? "" : snapshot(err));
+    try {
+      const reading = adapter.read(snapshot(out), code, code === null ? "" : snapshot(err));
+      if (!reading) throw new Error("它什么也没给");
+      return reading;
+    } catch (error) {
+      sayOnce(`run ${entry.run}: couldn't read its output: ${error}`);
+      // One still going goes on, since this says nothing about how it's doing. Whether one that has ended got started isn't
+      // known, and starting it again in a new session could do its work twice: it stays in this one.
+      return { started: true, error: `读不懂这个 Agent 的输出：${(error as Error).message ?? error}` };
+    }
   }
 
   function discardReceipt(entry: Entry, adapter: Adapter, problem: string) {
     const original = { ...entry, turn: entry.turn - entry.repairs };
     const reading = read(original, adapter, 0);
-    const { result } = resultFrom(readMessage(reading.text!), {
+    const { result } = resultFrom(readMessage(reading.text ?? ""), {
       session: reading.session ?? (adapter.link ? entry.session : undefined),
       usage: entry.usage,
     });
     const notice: Notice = {
       title: `「${entry.job.rule.name}」的回执读不懂`,
-      text: `这一轮按第一行算结束了，但它要中台做的事没有生效（${problem}）。原文在 ${files(original).out}。`,
+      text: `这一轮按第一行算结束了，但它要中台做的事没有生效（${problem}）。原文在 ${files(original).out}，留 ${KEEP_DAYS} 天。`,
     };
     endWith(entry, { ...result, notice: [...(result.notice ?? []), notice] });
   }
@@ -370,19 +399,31 @@ export function createWorker({
     }
     const { exit } = files(entry);
     if (entry.stopping !== undefined) {
-      if (groupAlive(entry)) {
-        if (now() - entry.stopping > STOP_GRACE) signal(entry, "SIGKILL");
-        return;
+      const going = groupAlive(entry);
+      if (going !== false) {
+        const overdue = now() - entry.stopping > STOP_GRACE;
+        if (overdue) signal(entry, "SIGKILL");
+        // Unable to look, the kill is the last we can know of it; waiting to see it gone would hold the run forever.
+        if (going || !overdue) return;
       }
       return conclude(entry, adapter, existsSync(exit) ? Number(readFileSync(exit, "utf8").trim()) : null);
     }
     if (existsSync(exit)) return conclude(entry, adapter, Number(readFileSync(exit, "utf8").trim()));
     // The shell can publish its exit between the first file check and ps returning.
-    if (!alive(entry)) {
+    const looking = alive(entry);
+    if (looking === false) {
       return conclude(entry, adapter, existsSync(exit) ? Number(readFileSync(exit, "utf8").trim()) : null);
     }
+    // Unable to look, the run counts as still going, so its timeout and its finished turn still end it.
+    if (looking === null && !blind) log(`couldn't run ps; runs count as going until they end or time out`);
+    blind = looking === null;
     const seen = read(entry, adapter, null);
-    const session = seen.session ?? (adapter.link ? (entry.resume ?? entry.session) : undefined);
+    // Kept as soon as it's read: if the end can't be read, the one made up at launch may be nothing its CLI knows of.
+    if (seen.session && seen.session !== entry.session) {
+      entry.session = seen.session;
+      save(entry);
+    }
+    const session = seen.session ?? (adapter.link ? entry.session : undefined);
     if (session && session !== entry.told) {
       try {
         await hub.started(entry.run, entry.token, { session, ...(adapter.link && { link: adapter.link(session) }) });
@@ -457,10 +498,26 @@ export function createWorker({
     }
   }
 
+  /** Trouble with one run, a folder it can't write to say, is for the next round and holds up no other. */
+  async function eachEntry(step: (entry: Entry) => Promise<unknown>) {
+    for (const entry of entries()) {
+      try {
+        await step(entry);
+      } catch (error) {
+        sayOnce(`run ${entry.run}: ${error}`);
+      }
+    }
+  }
+
   /** One round: look at what's in hand, hand in what's ended, come for more. Whether the hub could be reached. */
   async function tick() {
-    for (const entry of entries()) await check(entry);
-    for (const entry of entries()) await settle(entry);
+    // Here and not in run: whatever drives the worker comes through here.
+    if (now() - tidied >= TIDY_EVERY) {
+      tidied = now();
+      tidy(tidied);
+    }
+    await eachEntry(check);
+    await eachEntry(settle);
     const held = entries();
     let reachable = true;
     try {
@@ -490,14 +547,24 @@ export function createWorker({
   function tidy(moment = now()) {
     for (const id of readdirSync(RUNS)) {
       const dir = path.join(RUNS, id);
-      const expired = moment - statSync(dir).mtimeMs > KEEP_DAYS * 24 * 3600_000;
-      if (!existsSync(path.join(dir, "entry.json")) && expired) rmSync(dir, { recursive: true, force: true });
+      try {
+        const expired = moment - statSync(dir).mtimeMs > KEEP_DAYS * 24 * 3600_000;
+        if (!existsSync(path.join(dir, "entry.json")) && expired) rmSync(dir, { recursive: true, force: true });
+      } catch (error) {
+        sayOnce(`couldn't clear ${dir}: ${error}`);
+      }
+    }
+    try {
+      forgetOldUsage(moment);
+    } catch (error) {
+      sayOnce(`couldn't clear old session totals: ${error}`);
     }
   }
 
   async function run(signalled: AbortSignal) {
     log(`worker ${name} started`);
-    tidy();
+    // Started again after trouble, it may be what went: nothing else would bring it back, and every round needs it.
+    mkdirSync(RUNS, { recursive: true, mode: 0o700 });
     while (!signalled.aborted) {
       if (!(await tick())) await new Promise((resolve) => setTimeout(resolve, PAUSE));
     }

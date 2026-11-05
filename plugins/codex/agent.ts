@@ -46,6 +46,8 @@ export default {
       } catch {
         continue;
       }
+      // A login shell's profile prints here too, and `null` is valid JSON.
+      if (!event) continue;
       if (event.type === "thread.started") seen.session = event.thread_id;
       else if (event.type === "turn.started") seen.started = true;
       else if (event.type === "item.completed" && event.item?.type === "agent_message") seen.text = event.item.text;

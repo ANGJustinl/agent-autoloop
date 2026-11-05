@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { deadlines } from "../kernel/due.ts";
 import { snapshot, type Fact, type View, type Row } from "../kernel/evolve.ts";
 
 type Snapshot = ReturnType<typeof snapshot>;
@@ -77,5 +78,6 @@ export function invariants(current: View, log: Fact[], before?: Snapshot) {
       if (["done", "nothing", "cancelled"].includes(r.state))
         assert.deepEqual(view.tables.runs[r.id], r, "完成的回执再次生效");
   }
+  if (log.length) assert.deepEqual(view.tables.due, deadlines(current, log.at(-1)!.at), "到期表和重算的不一样");
   return view;
 }

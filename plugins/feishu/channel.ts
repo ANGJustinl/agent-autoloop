@@ -7,6 +7,16 @@ import { execFile, spawn } from "node:child_process";
 import readline from "node:readline";
 import type { Card, ChannelContext } from "../../host/channels.ts";
 
+/** Feishu sends these values as JSON in a string, which may be empty. */
+function safeJson(text: unknown): any {
+  if (typeof text !== "string" || !text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
 function outcomeOf(card: Card) {
   const chosen = card.choice === null ? card.answer : card.options[card.choice];
   if (card.state === "decided") return `你选了「${chosen}」，已记录，等待处理。`;
@@ -30,6 +40,39 @@ export function render(card: Card) {
     elements: [{ tag: "div", text: { tag: "plain_text", content: label } }],
   });
   const afterwards = outcome ? [{ tag: "markdown", content: `**${outcome}**` }] : [];
+  const noteSaid =
+    card.kind === "notice" && card.answer
+      ? [{ tag: "div", text: { tag: "plain_text", content: `处理说明：${card.answer}` } }]
+      : [];
+  const noteForm =
+    card.kind === "notice"
+      ? [
+          {
+            tag: "form",
+            name: "handling_note",
+            elements: [
+              {
+                tag: "input",
+                name: "note",
+                input_type: "multiline_text",
+                rows: 2,
+                auto_resize: true,
+                max_length: 1000,
+                label: { tag: "plain_text", content: "处理说明（可不填）" },
+                label_position: "top",
+                placeholder: { tag: "plain_text", content: "比如：已回复他视频下周发；或：群发广告，不用管" },
+              },
+              {
+                tag: "button",
+                name: `handling_note_submit_${card.id}`,
+                form_action_type: "submit",
+                type: "primary",
+                text: { tag: "plain_text", content: "记录并结案" },
+              },
+            ],
+          },
+        ]
+      : [];
   return {
     schema: "2.0",
     config: { update_multi: true, enable_forward: false },
@@ -40,7 +83,7 @@ export function render(card: Card) {
     body: {
       elements: [
         ...(card.text ? [{ tag: "markdown", content: card.text }] : []),
-        ...(card.state === "open" ? card.options.map(option) : afterwards),
+        ...(card.state === "open" ? [...noteForm, ...card.options.map(option)] : [...afterwards, ...noteSaid]),
       ],
     },
   };
@@ -103,10 +146,25 @@ export default async function feishu({ hub, options, log, signal }: ChannelConte
   /** Only the owner's click on the card that was sent counts; the hub checks both. */
   async function clicked(line: string) {
     const event = JSON.parse(line);
-    const value = JSON.parse(event.action_value);
-    if (!Number.isInteger(value.card) || !Number.isInteger(value.choice)) return;
-    const answer = await hub.answer(value.card, { choice: value.choice, by: event.operator_id, ref: event.message_id });
-    log(`card ${value.card}: answered by ${event.operator_id}, ${answer.changed ? "counted" : "already settled"}`);
+    const form = safeJson(event.form_value);
+    const value = safeJson(event.action_value);
+    // A form's submit button can't carry a value, so its name holds the card's number.
+    const named = /^handling_note_submit_(\d+)$/.exec(String(event.action_name ?? ""));
+    const cardId = Number.isInteger(value?.card) ? value.card : named ? Number(named[1]) : null;
+    if (!Number.isInteger(cardId)) return;
+    // A notice's only option is that it's been handled, so submitting the form picks it.
+    const choice = Number.isInteger(value?.choice) ? value.choice : form ? 0 : null;
+    if (choice === null) return;
+    const note = typeof form?.note === "string" ? form.note : undefined;
+    const given: { choice: number; by?: string; ref?: string; text?: string } = {
+      choice,
+      by: event.operator_id,
+      ref: event.message_id,
+    };
+    if (note !== undefined) given.text = note;
+    const answer = await hub.answer(cardId, given);
+    const how = form ? "note submitted" : "answered";
+    log(`card ${cardId}: ${how} by ${event.operator_id}, ${answer.changed ? "counted" : "already settled"}`);
   }
 
   async function listen() {

@@ -10,7 +10,8 @@ permissions:
 
 concurrency:
   group: check-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # A newer push to a PR makes its run pointless. On main a run covers everything before it, so it finishes.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   check:
@@ -25,8 +26,6 @@ jobs:
           fetch-depth: 0
       # These jobs stay required on main, so a docs change runs them too and they pass without doing anything.
       - id: scope
-        env:
-          BEFORE: ${{ github.event.before }}
         run: sh scripts/ci-scope.sh >> "$GITHUB_OUTPUT"
       - if: steps.scope.outputs.scope != 'docs'
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -39,8 +38,10 @@ jobs:
         run: npm run format:check
       - if: steps.scope.outputs.scope != 'docs'
         run: npm run typecheck
-      - if: steps.scope.outputs.scope == 'normal'
+      - if: steps.scope.outputs.scope == 'normal' || steps.scope.outputs.scope == 'kernel'
         run: npm run test:quick
+      - if: steps.scope.outputs.scope == 'kernel'
+        run: npm run test:sim
       - if: steps.scope.outputs.scope == 'full'
         run: npm test
       - if: steps.scope.outputs.scope != 'docs'

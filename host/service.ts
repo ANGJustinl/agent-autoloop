@@ -137,7 +137,21 @@ export function stopUp() {
   for (let tries = 0; tries < 50 && runningUp() !== null; tries++) pause(100);
 }
 
+/** The service this program installs and can restart. */
 export function serviceRunning() {
   if (process.platform === "darwin") return existsSync(plistFile()) && launchdHasIt();
   return spawnSync("systemctl", ["--user", "is-active", "--quiet", label()], { stdio: "ignore" }).status === 0;
+}
+
+/** The name of a system-level unit running this, as a server run by root might have. It's its owner's to restart. */
+export function systemUnit() {
+  if (process.platform === "darwin") return null;
+  return spawnSync("systemctl", ["is-active", "--quiet", label()], { stdio: "ignore" }).status === 0 ? label() : null;
+}
+
+/** New code counts once what's running starts again. What can't be restarted from here is said back, for the owner. */
+export function restartService() {
+  if (serviceRunning()) return void installService();
+  const name = systemUnit();
+  return name ? `这台电脑用的是系统级服务，运行 systemctl restart ${name} 才会用上新版。` : undefined;
 }

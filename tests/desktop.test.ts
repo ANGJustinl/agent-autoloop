@@ -4,7 +4,7 @@
 // an update to a card notifies again; a computer with no way to notify, a notifier that fails or a title that can't be passed
 // to a program stops the channel, or isn't reported; a slow notifier freezes the hub, which shares its process; init doesn't
 // set the channel up in both files, or changes a rules file already there; doctor says there's no channel when there is one,
-// or that one reaches you when none does.
+// or that one reaches you when none does, or says nothing of a channel where anyone can answer.
 import assert from "node:assert/strict";
 import { execFile, execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -282,6 +282,14 @@ test("doctor says what reaches you: only this computer, or nothing yet, or no wo
     assert.doesNotMatch(none, /只接了桌面通知/);
     const more = await hint({ desktop: { name: "桌面通知" }, feishu: { name: "飞书" } });
     assert.doesNotMatch(more, /只接了桌面通知|还没接通道/);
+    assert.match(more, /飞书没写 answerers：这个通道里谁都能回答卡片/);
+    assert.doesNotMatch(more, /桌面通知没写 answerers/, "nobody answers from a notification");
+    const limited = await hint({
+      desktop: { name: "桌面通知" },
+      feishu: { name: "飞书", answerers: ["ou_me"] },
+      webhook: { name: "钉钉", links: true },
+    });
+    assert.doesNotMatch(limited, /没写 answerers/, "someone named, or a link only its holder has");
   } finally {
     server.closeAllConnections();
     server.close();

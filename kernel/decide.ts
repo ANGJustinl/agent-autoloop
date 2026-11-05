@@ -2,7 +2,7 @@
 // to give. Time and secrets come in as arguments, so the same input on the same view always decides the same.
 import { credential, digest, type Environment } from "./credentials.ts";
 import { latestBefore, nextRun, parseCron } from "./cron.ts";
-import { deadlines, MINUTE, OFFLINE_AFTER, RUN_LEASE, SEEN_EVERY, WORKER_FRESH } from "./due.ts";
+import { deadlines, MINUTE, offlineCard, OFFLINE_AFTER, RUN_LEASE, SEEN_EVERY, WORKER_FRESH } from "./due.ts";
 import { AuthError, Conflict, InputError, NotFound } from "./errors.ts";
 import { iso, rows, type Change, type Fact, type Row, type Table, type View } from "./evolve.ts";
 import {
@@ -73,6 +73,8 @@ export function decide(view: View, input: Input, now: number, env: Environment):
   const rules = configuration(view);
   const draft: Draft = { view: view.fork(), seq: view.seq + 1, type, now, at: iso(now), env, rules, changes: [] };
   const value = HANDLERS[type](draft, ...args);
+  // With nothing changed nothing new can come due, and what only the clock changes has a deadline of its own to bring a tick.
+  if (!draft.changes.length && type !== "tick") return { facts: [], value };
   const due = deadlines(draft.view, now);
   for (const [key, row] of Object.entries(due)) {
     if (JSON.stringify(draft.view.get("due", key)) !== JSON.stringify(row)) put(draft, "due", key, row);
@@ -114,9 +116,10 @@ function assignQueued(draft: Draft, run: Row) {
 const threadOf = (run: Row) => ({ rule: run.rule, lane: run.lane, grp: run.grp });
 const hopsOf = (draft: Draft, run: Row) => Math.max(0, ...eventsOf(draft.view, run.id).map((event) => event.hops ?? 0));
 
-function closeCard(draft: Draft, card: Row, result: string, by: string | null = null) {
+function closeCard(draft: Draft, card: Row, result: string, by: string | null = null, note: string | null = null) {
   const closed = { state: "closed", closed_at: draft.at, version: card.version + 1 };
-  put(draft, "cards", card.id, { ...closed, result, by: by ?? card.by });
+  // A note says how a notice was handled, for looking back at later.
+  put(draft, "cards", card.id, { ...closed, result, by: by ?? card.by, ...(note ? { answer: note } : {}) });
 }
 
 function closeOpen(draft: Draft, matches: (key: string) => boolean, result: string) {
@@ -238,14 +241,14 @@ function sweep(draft: Draft) {
     const waiting = waitingOn(draft.view, worker, now);
     if (!waiting.length) continue;
     const since = now - (lastSeen ?? Date.parse(waiting[0].created_at));
-    if (since <= OFFLINE_AFTER) continue;
+    const { key, told } = offlineCard(draft.view, worker, waiting);
+    if (since <= OFFLINE_AFTER || told) continue;
     const minutes = Math.floor(since / MINUTE);
     const neverSeen = lastSeen === undefined;
     const situation = neverSeen
       ? `${worker} 一直没连上中台，有 ${waiting.length} 件任务等了 ${minutes} 分钟没人接`
       : `${worker} 已经 ${minutes} 分钟没连上中台，有 ${waiting.length} 件任务在排队或在跑`;
     const check = neverSeen ? "有没有开机联网" : "是不是关机、休眠或断网了";
-    const key = `worker:${worker}:offline:${neverSeen ? "never" : iso(lastSeen)}`;
     notify(draft, key, "接单程序没连上", `${situation}（请看一眼那台电脑${check}）。`);
   }
 }
@@ -276,7 +279,7 @@ function claimNext(draft: Draft, worker: string, claim: string) {
 
 /** Ends a run nothing will pick up again, and says so. */
 function stopRun(draft: Draft, run: Row, why: string, summary: string, words: string) {
-  put(draft, "runs", run.id, { ...run, state: "cancelled", finished_at: draft.at, summary });
+  put(draft, "runs", run.id, { state: "cancelled", finished_at: draft.at, summary });
   notify(draft, `run:${run.id}:${why}`, run.rule, words, threadOf(run));
 }
 
@@ -299,7 +302,8 @@ function retryLater(draft: Draft, run: Row, result: Result) {
   for (const notice of result.notice ?? []) cardFromReceipt(draft, run, "notice", notice);
   const failure = { attempts, error, ...unclaimed };
   if (!ruleNamed(draft, run.rule)) {
-    stopRun(draft, { ...run, ...failure }, "rule-gone", ...ruleGone(run));
+    put(draft, "runs", id, failure);
+    stopRun(draft, run, "rule-gone", ...ruleGone(run));
     return rejected;
   }
   if (attempts >= MAX_ATTEMPTS) {
@@ -307,7 +311,8 @@ function retryLater(draft: Draft, run: Row, result: Result) {
     const summary = `连续 ${MAX_ATTEMPTS} 次没跑成，不再自动重试`;
     closeOpen(draft, (key) => key === `run:${id}:failing`, summary);
     const words = `连续 ${MAX_ATTEMPTS} 次自动处理没跑完（卡在：${error}），不再自动重试。解决后重新触发这件事，它会从头开始。`;
-    stopRun(draft, { ...run, ...failure }, "stopped", summary, words);
+    put(draft, "runs", id, failure);
+    stopRun(draft, run, "stopped", summary, words);
     return rejected;
   }
   put(draft, "runs", id, { state: "queued", not_before: iso(notBefore), ...failure });
@@ -428,7 +433,10 @@ function answer(draft: Draft, id: number, given: Row) {
     throw new InputError(`消息编号最多 ${ANSWER_REF} 字`);
   }
   if (card.kind === "notice") {
-    closeCard(draft, card, "已处理", given.by ?? null);
+    if (given.text !== undefined && typeof given.text !== "string") throw new InputError("处理说明要是文字");
+    const note = given.text?.trim() || null;
+    if (note !== null && [...note].length > ANSWER_TEXT) throw new InputError(`处理说明最多 ${ANSWER_TEXT} 字`);
+    closeCard(draft, card, "已处理", given.by ?? null, note);
     return { changed: true, state: "closed" };
   }
   if (given.text !== undefined && typeof given.text !== "string") throw new InputError("回答要是文字");

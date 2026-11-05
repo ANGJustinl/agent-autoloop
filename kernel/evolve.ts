@@ -88,6 +88,8 @@ export class View {
   readonly format: string;
   private base?: View;
   private changes = new Map<Table, Map<string, Row | null>>();
+  // The biggest row there is, and every queued run asks for it. Facts bring a new view, so this can't go stale.
+  private configs = new Map<string, Row | undefined>();
   constructor(db: DatabaseSync, seq = 0, next: Record<string, number> = {}, format = "") {
     this.db = db;
     this.seq = seq;
@@ -99,8 +101,11 @@ export class View {
       changes = this.changes.get(table);
     if (changes?.has(id)) return changes.get(id) ?? undefined;
     if (this.base) return this.base.get(table, id);
+    if (table === "config" && this.configs.has(id)) return this.configs.get(id);
     const row = statement(this.db, "SELECT data FROM projections WHERE collection=? AND key=?").get(table, id);
-    return row ? freeze(JSON.parse(String(row.data))) : undefined;
+    const found = row ? freeze(JSON.parse(String(row.data))) : undefined;
+    if (table === "config") this.configs.set(id, found);
+    return found;
   }
 
   select(table: Table, match: Match = {}, limit?: number, reverse = false): Row[] {

@@ -45,11 +45,16 @@ export function cardPage(card: ReturnType<typeof cardView>) {
       return `<button name="choice" value="${index}"${best}>${escaped(option)}</button>`;
     };
     // Its own form: Enter in the box mustn't press the first option.
-    const box = `<input name="text" placeholder="别的想法" aria-label="别的想法" required>`;
-    const other = card.kind === "ask" ? `<form method="post">${box}<button>发送</button></form>` : "";
+    // A notice can take a line on how it was handled: optional, and kept with the closing.
+    const notice = card.kind === "notice";
+    const box = notice
+      ? `<input name="text" placeholder="我实际怎么处理的（可不填）" aria-label="处理说明">`
+      : `<input name="text" placeholder="别的想法" aria-label="别的想法" required>`;
+    const other = `<form method="post">${box}<button>${notice ? "记录并结案" : "发送"}</button></form>`;
     return shell(card.title, `${words}<form method="post">${card.options.map(button).join("")}</form>${other}`);
   }
-  const chosen = card.choice !== null ? card.options[card.choice] : card.answer;
+  const chosen = card.kind === "ask" ? (card.choice !== null ? card.options[card.choice] : card.answer) : null;
   const outcome = [chosen ? `你选了「${chosen}」` : "", card.result ?? ""].filter(Boolean).join("。");
-  return shell(card.title, `${words}${outcome ? `<p>${escaped(outcome)}</p>` : ""}`);
+  const settled = card.kind === "notice" && card.answer ? `<p>处理说明：${escaped(card.answer)}</p>` : "";
+  return shell(card.title, `${words}${outcome ? `<p>${escaped(outcome)}</p>` : ""}${settled}`);
 }

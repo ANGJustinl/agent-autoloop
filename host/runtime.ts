@@ -5,12 +5,11 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync
 import { join } from "node:path";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { HOME, RULES_FILE } from "./home.ts";
-import { credential, digest, whose as keyHolder } from "../kernel/credentials.ts";
+import { cardHash, credential, digest, whose as keyHolder } from "../kernel/credentials.ts";
 import { decide } from "../kernel/decide.ts";
-import { AuthError, NotFound } from "../kernel/errors.ts";
+import { NotFound } from "../kernel/errors.ts";
 import { evolve, rows, keyOf, statement, type Fact, type Row, type Table } from "../kernel/evolve.ts";
 import * as query from "../kernel/query.ts";
-import { eventRule, typeMatches } from "../kernel/rules.ts";
 import { stateOf as state } from "../kernel/state.ts";
 import { commitLatest, openView } from "../kernel/store.ts";
 import type { Job } from "../protocol/job.ts";
@@ -47,7 +46,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS projections(collection TEXT, key TEXT, data TEXT NOT NULL, PRIMARY KEY(collection, key));
 `);
 db.function("card_token", { deterministic: true }, (id, at) => credential(environment, "card", id, at));
-db.function("card_hash", { deterministic: true }, (id, at) => digest(credential(environment, "card", id, at)));
+db.function("card_hash", { deterministic: true }, (id, at) => cardHash(environment, id, at));
 
 const schema = readFileSync(new URL("../kernel/schema.sql", import.meta.url), "utf8");
 const views: string[] = [];
@@ -66,16 +65,21 @@ for (const [, table, body] of schema.matchAll(/CREATE TABLE (\w+) \(([\s\S]*?)\n
 // Other processes must see either the old views or the new ones, never the gap between DROP and CREATE.
 db.exec(`BEGIN IMMEDIATE; ${views.join(";")}; COMMIT`);
 
-// The persisted projection is expendable; the log alone rebuilds it.
+const CARD_HASH_INDEX =
+  "CREATE INDEX IF NOT EXISTS projection_card_hash ON projections(card_hash(json_extract(data,'$.id'),json_extract(data,'$.created_at'))) WHERE collection='cards'";
+
+// The persisted projection is expendable; the log alone rebuilds it, which an upgrade has to wait for. So only the files that
+// decide what's stored count here, whole, since what they do is spread across helpers and constants. The views above are
+// made anew at every start and need no rebuild.
 const format = digest(
-  ["../kernel/evolve.ts", "../kernel/schema.sql", "../kernel/credentials.ts", "./runtime.ts"]
+  ["../kernel/evolve.ts", "../kernel/credentials.ts"]
     .map((file) => readFileSync(new URL(file, import.meta.url), "utf8"))
-    .join("\n") + digest(environment.secret),
+    .join("\n") +
+    CARD_HASH_INDEX +
+    digest(environment.secret),
 );
 let current = openView(db, format);
-db.exec(
-  "CREATE INDEX IF NOT EXISTS projection_card_hash ON projections(card_hash(json_extract(data,'$.id'),json_extract(data,'$.created_at'))) WHERE collection='cards'",
-);
+db.exec(CARD_HASH_INDEX);
 
 export const all = <T>(sql: string, params: SQLInputValue[] = []) =>
   db
@@ -114,7 +118,7 @@ export function execute(type: string, args: any[], now = Date.now()) {
 
 export const parseRules = (json: string, now = Date.now()) =>
   checkRules(json, now, Intl.DateTimeFormat().resolvedOptions().timeZone);
-export { RulesError, typeMatches };
+export { RulesError };
 export let rules = query.configuration(current);
 let loaded = { file: "", mtime: 0 };
 
@@ -126,17 +130,20 @@ export function reloadRules(file = RULES_FILE) {
     if (loaded.file === file && loaded.mtime === mtime) return { changed: false };
     text = readFileSync(file, "utf8");
   } catch (error) {
-    // Forget the last read: a file moved back keeps its old mtime and must still be read again.
+    // A file moved back keeps its old mtime and must still be read again.
     loaded = { file: "", mtime: 0 };
     return { changed: false, problem: unreadable(file, error as NodeJS.ErrnoException) };
   }
-  loaded = { file, mtime };
+  // Only a read that took effect is remembered. Whatever stopped this one has to be found again: at startup there's nobody
+  // to tell yet, and a database that's busy can take neither the new rules nor the news about bad ones.
+  loaded = { file: "", mtime: 0 };
   try {
     const next = parseRules(text);
     const differs = JSON.stringify(next) !== JSON.stringify(query.configuration(getView()));
     const reportedBroken = (card: Row) => card.key.startsWith("rules:") && card.state === "open";
     if (differs || rows(current, "cards", { state: "open" }).some(reportedBroken)) execute("rules", [next]);
     rules = next;
+    loaded = { file, mtime };
     return { changed: true };
   } catch (error) {
     if (error instanceof RulesError) return { changed: false, problem: error.message };
@@ -154,11 +161,6 @@ const initial = reloadRules();
 if (!rules) throw new Error(initial.problem ?? "缺少规则");
 
 export const ruleNamed = (name: string) => rules.rules.find((rule) => rule.name === name);
-export const rulesFor = (source: string, type: string) =>
-  rules.rules.filter((rule) => eventRule(rule) && rule.when.source === source && typeMatches(rule.when.types, type));
-export const workers = () => [...new Set(Object.values(rules.agents).map((agent) => agent.worker))];
-export const agentsOf = (worker: string) => query.agentsOf(getView(), worker);
-export const limitOf = (group: string) => rules.rules.find((rule) => rule.group === group)?.parallel ?? 1;
 
 type EventAck = { event: number; duplicate: boolean; routed: string[] };
 export const ingest = (source: string, input: unknown, now = Date.now()): EventAck =>
@@ -176,9 +178,13 @@ export const cancel = (run: number, now = Date.now()) => execute("cancel", [run]
 export const cancels = (worker: string) => query.cancels(getView(), worker);
 export const sweep = (now = Date.now()) => execute("sweep", [], now);
 
+let toldOf: string | undefined;
+
 export function tick(now = Date.now()) {
   const { problem } = reloadRules();
-  if (problem) execute("rulesError", [problem], now);
+  // A file still gone or still wrong is a problem at every tick, and an owner who closed the card has heard.
+  if (problem && problem !== toldOf) execute("rulesError", [problem], now);
+  toldOf = problem;
   execute("tick", [], now);
 }
 
@@ -204,20 +210,6 @@ export function cardByToken(token: string) {
     "SELECT data FROM projections WHERE collection='cards' AND card_hash(json_extract(data,'$.id'),json_extract(data,'$.created_at'))=?",
   ).get(digest(token));
   return row ? (JSON.parse(String(row.data)) as Row) : undefined;
-}
-
-export function cardAtLink(token: string) {
-  const card = cardByToken(token);
-  if (!card || !Object.values(rules.channels).some((channel) => channel.links)) throw new NotFound("没有这张卡片");
-  return card;
-}
-
-export function answerByLink(token: string, given: Answer, now = Date.now()) {
-  const card = cardAtLink(token);
-  if (now - Date.parse(card.created_at) > 7 * 86400_000) {
-    throw new AuthError(`这个链接过期了。在装它的电脑上运行 agent-autoloop answer ${card.id} 回答`);
-  }
-  return answer(card.id, { ...given, by: "链接" }, now);
 }
 
 export const view = (card: Row, ref: string | null = null, links = false) =>

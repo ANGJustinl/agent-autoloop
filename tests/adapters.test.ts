@@ -5,7 +5,8 @@
 // an application's browser connection. A turn that got going and then broke, or was killed before it finished, doesn't
 // say it started, so the worker runs its prompt again; one that never got going says it did, so the worker doesn't start a
 // new session for it; what Claude said before a background task ended is taken for its answer, or starts the wait for a
-// turn that won't exit; the raw messages of a broken Claude run become the reason it failed.
+// turn that won't exit; the raw messages of a broken Claude run become the reason it failed. A line of output that's JSON
+// but no message, like `null`, stops a plugin reading anything.
 import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -280,4 +281,12 @@ test("a plain command: placeholders filled in, stdout is its last message, a bad
 
 test("a program that isn't there says so", () => {
   assert.throws(() => findProgram("surely-not-installed-anywhere"), /找不到 surely-not-installed-anywhere/);
+});
+
+test("a line of output that's JSON but no message is noise to every plugin", () => {
+  const noise = 'null\n42\n"words"\n[]\n';
+  for (const adapter of [claude, codex, command]) {
+    assert.doesNotThrow(() => adapter.read(noise, null, ""));
+    assert.doesNotThrow(() => adapter.read(noise, 0, ""));
+  }
 });

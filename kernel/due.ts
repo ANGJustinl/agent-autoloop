@@ -17,6 +17,18 @@ export const OFFLINE_AFTER = 10 * MINUTE;
  */
 export const SEEN_EVERY = MINUTE;
 
+/**
+ * The card about a worker gone away, and whether it has said all there is to say: it's still open, or the owner closed it
+ * after everything now waiting had come in. Anything newer is news, or one closed card would hide it until the worker's back.
+ */
+export function offlineCard(view: View, worker: string, waiting: Row[]) {
+  const seen = view.get("seen", `worker:${worker}`);
+  const key = `worker:${worker}:offline:${seen ? seen.seen_at : "never"}`;
+  const card = rows(view, "cards", { key }, 1, true)[0];
+  const told = card && (card.state === "open" || waiting.every((run) => run.created_at <= card.closed_at));
+  return { key, told };
+}
+
 export function deadlines(view: View, now: number) {
   const due: Record<string, Row> = {};
   const add = (kind: string, key: string, at: number) => {
@@ -44,9 +56,8 @@ export function deadlines(view: View, now: number) {
     const seen = view.get("seen", `worker:${worker}`);
     const waiting = waitingOn(view, worker, now);
     if (!waiting.length) continue;
-    const offlineKey = `worker:${worker}:offline:${seen ? seen.seen_at : "never"}`;
     // The sweep acts strictly after each limit, hence the extra millisecond.
-    if (!rows(view, "cards", { key: offlineKey, state: "open" }).length) {
+    if (!offlineCard(view, worker, waiting).told) {
       add("offline", worker, Math.max(now, Date.parse(seen?.seen_at ?? waiting[0].created_at) + OFFLINE_AFTER + 1));
     }
     if (!seen || now - Date.parse(seen.seen_at) > WORKER_FRESH) continue;
